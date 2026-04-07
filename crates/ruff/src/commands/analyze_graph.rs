@@ -7,7 +7,6 @@ use log::{debug, warn};
 use path_absolutize::CWD;
 use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
 use ruff_graph::{Direction, ImportMap, ModuleDb, ModuleImports};
-use ruff_linter::package::PackageRoot;
 use ruff_linter::source_kind::SourceKind;
 use ruff_linter::{warn_user, warn_user_once};
 use ruff_python_ast::SourceType;
@@ -51,49 +50,18 @@ pub(crate) fn analyze_graph(
         return Ok(ExitStatus::Success);
     }
 
-    // Resolve all package roots.
-    let package_roots = resolver
-        .package_roots(
-            &paths
-                .iter()
-                .flatten()
-                .map(ResolvedFile::path)
-                .collect::<Vec<_>>(),
-        )
-        .into_iter()
-        .map(|(path, package)| {
-            (
-                path.to_path_buf(),
-                package.map(PackageRoot::path).map(Path::to_path_buf),
-            )
-        })
-        .collect::<FxHashMap<_, _>>();
-
-    // Create a database from the source roots, combining configured `src` paths with detected
-    // package roots. Configured paths are added first so they take precedence, and duplicates
-    // are removed.
+    // Collect `src` paths from all discovered configs (root + hierarchically discovered).
     let mut src_roots: IndexSet<SystemPathBuf, FxBuildHasher> = IndexSet::default();
-
-    // Add configured `src` paths first (for precedence), filtering to only include existing
-    // directories.
-    src_roots.extend(
-        pyproject_config
-            .settings
-            .linter
-            .src
-            .iter()
-            .filter(|path| path.is_dir())
-            .filter_map(|path| SystemPathBuf::from_path_buf(path.clone()).ok()),
-    );
-
-    // Add detected package roots.
-    src_roots.extend(
-        package_roots
-            .values()
-            .filter_map(|package| package.as_deref())
-            .filter_map(|path| path.parent())
-            .filter_map(|path| SystemPathBuf::from_path_buf(path.to_path_buf()).ok()),
-    );
+    for settings in resolver.settings() {
+        src_roots.extend(
+            settings
+                .linter
+                .src
+                .iter()
+                .filter(|path| path.is_dir())
+                .filter_map(|path| SystemPathBuf::from_path_buf(path.clone()).ok()),
+        );
+    }
 
     let system = OsSystem::default();
     let db = ModuleDb::from_src_roots(
@@ -125,10 +93,6 @@ pub(crate) fn analyze_graph(
                 };
 
                 let path = resolved_file.path();
-                let package = path
-                    .parent()
-                    .and_then(|parent| package_roots.get(parent))
-                    .and_then(Clone::clone);
 
                 // Resolve the per-file settings.
                 let settings = resolver.resolve(path);
@@ -148,11 +112,6 @@ pub(crate) fn analyze_graph(
                     continue;
                 }
 
-                // Convert to system paths.
-                let Ok(package) = package.map(SystemPathBuf::from_path_buf).transpose() else {
-                    warn!("Failed to convert package to system path");
-                    continue;
-                };
                 let Ok(path) = SystemPathBuf::from_path_buf(resolved_file.into_path()) else {
                     warn!("Failed to convert path to system path");
                     continue;
@@ -184,7 +143,6 @@ pub(crate) fn analyze_graph(
                         source_code,
                         source_type.expect_python(),
                         &path,
-                        package.as_deref(),
                         string_imports,
                         type_checking_imports,
                     )

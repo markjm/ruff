@@ -16,6 +16,7 @@ success: true
 exit_code: 0
 ----- stdout -----
 Resolved settings for: "[TMP]/foo/test.py"
+Settings path: "[TMP]/foo/pyproject.toml"
 
 # General Settings
 cache_dir = "[TMP]/.ruff_cache"
@@ -63,11 +64,11 @@ file_resolver.include = [
 ]
 file_resolver.extend_include = []
 file_resolver.respect_gitignore = true
-file_resolver.project_root = "[TMP]/"
+file_resolver.project_root = "[TMP]/foo"
 
 # Linter Settings
 linter.exclude = []
-linter.project_root = "[TMP]/"
+linter.project_root = "[TMP]/foo"
 linter.rules.enabled = [
 	non-pep604-annotation-union (UP007),
 ]
@@ -90,8 +91,8 @@ linter.ignore_init_module_imports = true
 linter.logger_objects = []
 linter.namespace_packages = []
 linter.src = [
-	"[TMP]/",
-	"[TMP]/src",
+	"[TMP]/foo",
+	"[TMP]/foo/src",
 ]
 linter.tab_size = 4
 linter.line_length = 88

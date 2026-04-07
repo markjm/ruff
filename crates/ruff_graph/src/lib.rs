@@ -2,10 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
 
+use ruff_db::files::system_path_to_file;
 use ruff_db::system::{SystemPath, SystemPathBuf};
 use ruff_python_ast::PySourceType;
-use ruff_python_ast::helpers::to_module_path;
 use ruff_python_parser::{ParseOptions, parse};
+use ty_module_resolver::file_to_module;
 
 use crate::collector::Collector;
 pub use crate::db::ModuleDb;
@@ -28,17 +29,28 @@ impl ModuleImports {
         source: &str,
         source_type: PySourceType,
         path: &SystemPath,
-        package: Option<&SystemPath>,
         string_imports: StringImports,
         type_checking_imports: bool,
     ) -> Result<Self> {
         // Parse the source code.
         let parsed = parse(source, ParseOptions::from(source_type))?;
 
-        let module_path =
-            package.and_then(|package| to_module_path(package.as_std_path(), path.as_std_path()));
+        // Use the module resolver to determine the module path for this file.
+        // This leverages the database's search paths (and desperate resolution fallback)
+        // rather than manually computing the path from the package root.
+        let module_path = system_path_to_file(db, path).ok().and_then(|file| {
+            let module = file_to_module(db, file)?;
+            let name = module.name(db);
+            let mut components: Vec<String> = name.components().map(String::from).collect();
+            // For __init__.py files, the module name doesn't include "__init__" but the
+            // Collector needs it to correctly resolve relative imports (popping one level
+            // from __init__ returns you to the package level).
+            if path.ends_with("__init__.py") || path.ends_with("__init__.pyi") {
+                components.push("__init__".to_string());
+            }
+            Some(components)
+        });
 
-        // Collect the imports.
         let imports = Collector::new(
             module_path.as_deref(),
             string_imports,

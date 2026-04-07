@@ -23,7 +23,7 @@ use ruff_linter::package::PackageRoot;
 use ruff_linter::packaging::is_package;
 
 use crate::configuration::Configuration;
-use crate::pyproject::settings_toml;
+use crate::pyproject::settings_toml_with;
 use crate::settings::Settings;
 use crate::{FileResolverSettings, pyproject};
 
@@ -270,6 +270,26 @@ impl<'a> Resolver<'a> {
         std::iter::once(&self.pyproject_config.settings)
             .chain(self.settings.iter().map(|(settings, _)| settings))
     }
+
+    /// Create settings for a sub-project boundary (a `pyproject.toml` without
+    /// `[tool.ruff]`). Inherits all settings from the closest parent config
+    /// but overrides `src` to default to `[dir, dir/src]`, matching ruff's
+    /// default behavior for a project rooted at `dir`.
+    fn inherit_settings_for_subproject(&self, dir: &Path) -> Settings {
+        let parent = self.resolve(dir);
+        let mut settings = parent.clone();
+        settings.linter.src = vec![dir.to_path_buf(), dir.join("src")];
+        settings.linter.project_root = dir.to_path_buf();
+        settings.file_resolver.project_root = dir.to_path_buf();
+        settings
+    }
+}
+
+/// Return `true` if the path is a `pyproject.toml` that does not contain
+/// a `[tool.ruff]` section (i.e., it's a bare project boundary).
+fn is_bare_pyproject_toml(path: &Path) -> Result<bool> {
+    Ok(path.file_name().and_then(OsStr::to_str) == Some("pyproject.toml")
+        && !pyproject::ruff_enabled(path)?)
 }
 
 /// A wrapper around `detect_package_root` to cache filesystem lookups.
@@ -452,14 +472,19 @@ pub fn project_files_in_path<'a>(
         for path in &paths {
             for ancestor in path.ancestors() {
                 if seen.insert(ancestor) {
-                    if let Some(pyproject) = settings_toml(ancestor)? {
-                        let (root, settings) = resolve_scoped_settings(
-                            &pyproject,
-                            transformer,
-                            ConfigurationOrigin::Ancestor,
-                        )?;
-                        resolver.add(&root, settings, pyproject);
-                        // We found the closest configuration.
+                    if let Some(settings_path) = settings_toml_with(ancestor, false)? {
+                        if is_bare_pyproject_toml(&settings_path)? {
+                            let settings =
+                                resolver.inherit_settings_for_subproject(ancestor);
+                            resolver.add(ancestor, settings, settings_path);
+                        } else {
+                            let (root, settings) = resolve_scoped_settings(
+                                &settings_path,
+                                transformer,
+                                ConfigurationOrigin::Ancestor,
+                            )?;
+                            resolver.add(&root, settings, settings_path);
+                        }
                         break;
                     }
                 } else {
@@ -643,24 +668,46 @@ impl ParallelVisitor for PythonFilesVisitor<'_, '_> {
                     .file_type()
                     .is_some_and(|file_type| file_type.is_dir())
                 {
-                    match settings_toml(entry.path()) {
-                        Ok(Some(pyproject)) => match resolve_scoped_settings(
-                            &pyproject,
-                            self.transformer,
-                            ConfigurationOrigin::Ancestor,
-                        ) {
-                            Ok((root, settings)) => {
-                                self.global
-                                    .resolver
-                                    .write()
-                                    .unwrap()
-                                    .add(&root, settings, pyproject);
+                    match settings_toml_with(entry.path(), false) {
+                        Ok(Some(settings_path)) => {
+                            match is_bare_pyproject_toml(&settings_path) {
+                                Ok(true) => {
+                                    let dir = entry.path();
+                                    let settings = self
+                                        .global
+                                        .resolver
+                                        .read()
+                                        .unwrap()
+                                        .inherit_settings_for_subproject(dir);
+                                    self.global
+                                        .resolver
+                                        .write()
+                                        .unwrap()
+                                        .add(dir, settings, settings_path);
+                                }
+                                Ok(false) => match resolve_scoped_settings(
+                                    &settings_path,
+                                    self.transformer,
+                                    ConfigurationOrigin::Ancestor,
+                                ) {
+                                    Ok((root, settings)) => {
+                                        self.global
+                                            .resolver
+                                            .write()
+                                            .unwrap()
+                                            .add(&root, settings, settings_path);
+                                    }
+                                    Err(err) => {
+                                        self.local_error = Err(err);
+                                        return WalkState::Quit;
+                                    }
+                                },
+                                Err(err) => {
+                                    self.local_error = Err(err);
+                                    return WalkState::Quit;
+                                }
                             }
-                            Err(err) => {
-                                self.local_error = Err(err);
-                                return WalkState::Quit;
-                            }
-                        },
+                        }
                         Ok(None) => {}
                         Err(err) => {
                             self.local_error = Err(err);
@@ -771,10 +818,18 @@ pub fn project_file_at_path(
     // Search for `pyproject.toml` files in all parent directories.
     if resolver.is_hierarchical() {
         for ancestor in path.ancestors() {
-            if let Some(pyproject) = settings_toml(ancestor)? {
-                let (root, settings) =
-                    resolve_scoped_settings(&pyproject, transformer, ConfigurationOrigin::Unknown)?;
-                resolver.add(&root, settings, pyproject);
+            if let Some(settings_path) = settings_toml_with(ancestor, false)? {
+                if is_bare_pyproject_toml(&settings_path)? {
+                    let settings = resolver.inherit_settings_for_subproject(ancestor);
+                    resolver.add(ancestor, settings, settings_path);
+                } else {
+                    let (root, settings) = resolve_scoped_settings(
+                        &settings_path,
+                        transformer,
+                        ConfigurationOrigin::Unknown,
+                    )?;
+                    resolver.add(&root, settings, settings_path);
+                }
                 break;
             }
         }

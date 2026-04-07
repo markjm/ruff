@@ -83,7 +83,14 @@ pub fn ruff_enabled<P: AsRef<Path>>(path: P) -> Result<bool> {
 
 /// Return the path to the `pyproject.toml` or `ruff.toml` file in a given
 /// directory.
-pub fn settings_toml<P: AsRef<Path>>(path: P) -> Result<Option<PathBuf>> {
+///
+/// When `require_ruff_enabled` is `true`, a `pyproject.toml` is only returned
+/// if it contains a `[tool.ruff]` section. When `false`, any `pyproject.toml`
+/// is returned regardless of whether it has ruff configuration.
+pub fn settings_toml_with<P: AsRef<Path>>(
+    path: P,
+    require_ruff_enabled: bool,
+) -> Result<Option<PathBuf>> {
     let path = path.as_ref();
     // Check for `.ruff.toml`.
     let ruff_toml = path.join(".ruff.toml");
@@ -99,11 +106,19 @@ pub fn settings_toml<P: AsRef<Path>>(path: P) -> Result<Option<PathBuf>> {
 
     // Check for `pyproject.toml`.
     let pyproject_toml = path.join("pyproject.toml");
-    if pyproject_toml.is_file() && ruff_enabled(&pyproject_toml)? {
+    if pyproject_toml.is_file()
+        && (!require_ruff_enabled || ruff_enabled(&pyproject_toml)?)
+    {
         return Ok(Some(pyproject_toml));
     }
 
     Ok(None)
+}
+
+/// Return the path to the `pyproject.toml` or `ruff.toml` file in a given
+/// directory, requiring `[tool.ruff]` for `pyproject.toml` files.
+pub fn settings_toml<P: AsRef<Path>>(path: P) -> Result<Option<PathBuf>> {
+    settings_toml_with(path, true)
 }
 
 /// Find the path to the `pyproject.toml` or `ruff.toml` file, if such a file

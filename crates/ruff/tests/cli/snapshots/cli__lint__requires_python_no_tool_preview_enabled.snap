@@ -18,6 +18,7 @@ success: true
 exit_code: 0
 ----- stdout -----
 Resolved settings for: "[TMP]/test.py"
+Settings path: "[TMP]/pyproject.toml"
 
 # General Settings
 cache_dir = "[TMP]/.ruff_cache"
