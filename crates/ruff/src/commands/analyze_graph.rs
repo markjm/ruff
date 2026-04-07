@@ -2,17 +2,20 @@ use crate::args::{AnalyzeGraphArgs, ConfigArguments};
 use crate::resolve::resolve;
 use crate::{ExitStatus, resolve_default_files};
 use anyhow::Result;
-use indexmap::IndexSet;
 use log::{debug, warn};
 use path_absolutize::CWD;
 use ruff_db::system::{OsSystem, SystemPath, SystemPathBuf};
+use indexmap::IndexSet;
 use ruff_graph::{Direction, ImportMap, ModuleDb, ModuleImports};
-use ruff_linter::package::PackageRoot;
 use ruff_linter::source_kind::SourceKind;
 use ruff_linter::{warn_user, warn_user_once};
 use ruff_python_ast::SourceType;
-use ruff_workspace::resolver::{ResolvedFile, match_exclusion, project_files_in_path};
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use ruff_workspace::pyproject;
+use ruff_workspace::resolver::{
+    ConfigurationOrigin, ResolvedFile, match_exclusion, project_files_in_path,
+    resolve_root_settings,
+};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -51,49 +54,63 @@ pub(crate) fn analyze_graph(
         return Ok(ExitStatus::Success);
     }
 
-    // Resolve all package roots.
-    let package_roots = resolver
-        .package_roots(
-            &paths
-                .iter()
-                .flatten()
-                .map(ResolvedFile::path)
-                .collect::<Vec<_>>(),
-        )
-        .into_iter()
-        .map(|(path, package)| {
-            (
-                path.to_path_buf(),
-                package.map(PackageRoot::path).map(Path::to_path_buf),
-            )
-        })
-        .collect::<FxHashMap<_, _>>();
-
-    // Create a database from the source roots, combining configured `src` paths with detected
-    // package roots. Configured paths are added first so they take precedence, and duplicates
-    // are removed.
+    // Collect `src` paths from all discovered configs (root + hierarchically discovered).
     let mut src_roots: IndexSet<SystemPathBuf, FxBuildHasher> = IndexSet::default();
+    for settings in resolver.settings() {
+        src_roots.extend(
+            settings
+                .linter
+                .src
+                .iter()
+                .filter(|path| path.is_dir())
+                .filter_map(|path| SystemPathBuf::from_path_buf(path.clone()).ok()),
+        );
+    }
 
-    // Add configured `src` paths first (for precedence), filtering to only include existing
-    // directories.
-    src_roots.extend(
-        pyproject_config
-            .settings
-            .linter
-            .src
-            .iter()
-            .filter(|path| path.is_dir())
-            .filter_map(|path| SystemPathBuf::from_path_buf(path.clone()).ok()),
-    );
+    // Discover sub-project boundaries from bare pyproject.toml files (those
+    // without [tool.ruff]) that the hierarchical resolver skipped. Parse each
+    // to get properly defaulted `src` paths (e.g. [".", "src"]).
+    let mut seen_dirs: FxHashSet<PathBuf> = FxHashSet::default();
+    for resolved_file in &paths {
+        let Ok(resolved_file) = resolved_file else {
+            continue;
+        };
+        let path = resolved_file.path();
+        for ancestor in path.ancestors() {
+            if !seen_dirs.insert(ancestor.to_path_buf()) {
+                break;
+            }
+            let pyproject = ancestor.join("pyproject.toml");
+            if pyproject.is_file() {
+                if !pyproject::ruff_enabled(&pyproject).unwrap_or(false) {
+                    match resolve_root_settings(
+                        &pyproject,
+                        config_arguments,
+                        ConfigurationOrigin::Ancestor,
+                    ) {
+                        Ok(settings) => {
+                            src_roots.extend(
+                                settings
+                                    .linter
+                                    .src
+                                    .iter()
+                                    .filter(|path| path.is_dir())
+                                    .filter_map(|path| {
+                                        SystemPathBuf::from_path_buf(path.clone()).ok()
+                                    }),
+                            );
+                        }
+                        Err(err) => {
+                            warn!("Failed to parse {}: {err}", pyproject.display());
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
 
-    // Add detected package roots.
-    src_roots.extend(
-        package_roots
-            .values()
-            .filter_map(|package| package.as_deref())
-            .filter_map(|path| path.parent())
-            .filter_map(|path| SystemPathBuf::from_path_buf(path.to_path_buf()).ok()),
-    );
+    debug!("src_roots ({} total): {:?}", src_roots.len(), src_roots);
 
     let system = OsSystem::default();
     let db = ModuleDb::from_src_roots(
@@ -125,10 +142,6 @@ pub(crate) fn analyze_graph(
                 };
 
                 let path = resolved_file.path();
-                let package = path
-                    .parent()
-                    .and_then(|parent| package_roots.get(parent))
-                    .and_then(Clone::clone);
 
                 // Resolve the per-file settings.
                 let settings = resolver.resolve(path);
@@ -148,11 +161,6 @@ pub(crate) fn analyze_graph(
                     continue;
                 }
 
-                // Convert to system paths.
-                let Ok(package) = package.map(SystemPathBuf::from_path_buf).transpose() else {
-                    warn!("Failed to convert package to system path");
-                    continue;
-                };
                 let Ok(path) = SystemPathBuf::from_path_buf(resolved_file.into_path()) else {
                     warn!("Failed to convert path to system path");
                     continue;
@@ -184,7 +192,6 @@ pub(crate) fn analyze_graph(
                         source_code,
                         source_type.expect_python(),
                         &path,
-                        package.as_deref(),
                         string_imports,
                         type_checking_imports,
                     )
